@@ -1,4 +1,5 @@
 import io
+import sys
 import unittest
 
 
@@ -485,6 +486,7 @@ class TestWSGITask(unittest.TestCase):
     def test_execute_bad_header_value_control_characters(self):
         def app(environ, start_response):
             start_response("200 OK", [("a", "\n")])
+            return []
 
         inst = self._makeOne()
         inst.channel.server.application = app
@@ -493,6 +495,7 @@ class TestWSGITask(unittest.TestCase):
     def test_execute_bad_header_name_control_characters(self):
         def app(environ, start_response):
             start_response("200 OK", [("a\r", "value")])
+            return []
 
         inst = self._makeOne()
         inst.channel.server.application = app
@@ -701,6 +704,318 @@ class TestWSGITask(unittest.TestCase):
         self.assertListEqual(inst.channel.otherdata, [app_iter])
         self.assertEqual(inst.content_length, 3)
         self.assertIn(("Content-Length", "3"), inst.response_headers)
+
+    def _run_app(self, app, command="GET"):
+        inst = self._makeOne()
+        inst.request.command = command
+        inst.channel.server.application = app
+        inst.execute()
+        inst.finish()
+        return inst
+
+    def test_exc_info_replacement_clears_stale_content_length(self):
+        def app(environ, start_response):
+            try:
+                start_response("200 OK", [("Content-Length", "1")])
+                raise ValueError("boom")
+            except ValueError:
+                start_response(
+                    "500 Error",
+                    [("Content-Type", "text/plain")],
+                    sys.exc_info(),
+                )
+                return [b"ERROR"]
+
+        inst = self._run_app(app)
+        wire = inst.channel.written
+        self.assertIn(b"HTTP/1.0 500 Error", wire)
+        self.assertIn(b"Content-Length: 5", wire)
+        self.assertNotIn(b"Content-Length: 1", wire)
+        self.assertEqual(wire[-5:], b"ERROR")
+        self.assertEqual(inst.content_length, 5)
+        self.assertFalse(inst.chunked_response)
+        # exactly one HTTP response was written
+        self.assertEqual(wire.count(b"HTTP/1.0 "), 1)
+
+    def test_invalid_last_header_followed_by_legal_error_response(self):
+        def app(environ, start_response):
+            try:
+                start_response(
+                    "200 OK",
+                    [("X-Good", "1"), ("Bad-Name\r", "2")],
+                )
+            except ValueError:
+                start_response(
+                    "500 Error",
+                    [("Content-Type", "text/plain")],
+                    sys.exc_info(),
+                )
+                return [b"ERROR"]
+
+        inst = self._run_app(app)
+        wire = inst.channel.written
+        self.assertIn(b"HTTP/1.0 500 Error", wire)
+        self.assertIn(b"Content-Length: 5", wire)
+        self.assertNotIn(b"X-Good", wire)
+        self.assertEqual(wire[-5:], b"ERROR")
+
+    def test_rejected_candidate_leaves_previous_response_untouched(self):
+        def app(environ, start_response):
+            start_response(
+                "200 OK",
+                [("Content-Length", "3"), ("X-Good", "yes")],
+            )
+            with self.assertRaises(ValueError):
+                start_response(
+                    "500 Error",
+                    [("Bad\r", "x")],
+                    (ValueError, ValueError("boom"), None),
+                )
+            return [b"abc"]
+
+        inst = self._makeOne()
+        inst.channel.server.application = app
+        inst.execute()
+        self.assertEqual(inst.status, "200 OK")
+        self.assertEqual(inst.content_length, 3)
+        self.assertIn(("X-Good", "yes"), inst.response_headers)
+
+    def test_exc_info_after_headers_written_reraises_and_ends_connection(self):
+        class Boom(Exception):
+            pass
+
+        def app(environ, start_response):
+            write = start_response("200 OK", [("Content-Length", "10")])
+            write(b"abc")
+            start_response(
+                "500 Error",
+                [("Content-Type", "text/plain")],
+                (Boom, Boom("too late"), None),
+            )
+            return [b"never sent"]
+
+        inst = self._makeOne()
+        inst.channel.server.application = app
+        with self.assertRaises(Boom):
+            inst.execute()
+        inst.close_on_finish = True
+        wire = inst.channel.written
+        self.assertEqual(wire.count(b"HTTP/1.0 "), 1)
+        self.assertIn(b"HTTP/1.0 200 OK", wire)
+        self.assertNotIn(b"500 Error", wire)
+        self.assertTrue(wire.endswith(b"abc"))
+
+    def test_iterator_exception_closes_iterable_once(self):
+        class ExplodingIterable:
+            def __init__(self):
+                self.close_count = 0
+
+            def __iter__(self):
+                yield b"abc"
+                raise ValueError("iterator blew up")
+
+            def close(self):
+                self.close_count += 1
+
+        app_iter = ExplodingIterable()
+
+        def app(environ, start_response):
+            start_response("200 OK", [])
+            return app_iter
+
+        inst = self._makeOne()
+        inst.version = "1.1"
+        inst.channel.server.application = app
+        with self.assertRaises(ValueError):
+            inst.execute()
+        self.assertEqual(app_iter.close_count, 1)
+        # headers plus one chunk, with no terminating zero-length chunk
+        wire = inst.channel.written
+        self.assertIn(b"Transfer-Encoding: chunked", wire)
+        self.assertIn(b"3\r\nabc\r\n", wire)
+        self.assertFalse(wire.endswith(b"0\r\n\r\n"))
+
+    def test_head_request_regression(self):
+        def app(environ, start_response):
+            start_response("200 OK", [("Content-Length", "3")])
+            return [b"abc"]
+
+        inst = self._makeOne()
+        inst.version = "1.1"
+        inst.request.command = "HEAD"
+        inst.channel.server.application = app
+        inst.execute()
+        inst.finish()
+        wire = inst.channel.written
+        self.assertIn(b"Content-Length: 3", wire)
+        self.assertNotIn(b"Transfer-Encoding", wire)
+        self.assertIn(b"\r\n\r\nabc", wire)
+        self.assertFalse(inst.close_on_finish)
+
+    def test_204_response_has_no_body_or_framing_headers(self):
+        def app(environ, start_response):
+            start_response("204 No Content", [("Content-Length", "3")])
+            return [b"abc"]
+
+        inst = self._run_app(app)
+        wire = inst.channel.written
+        self.assertIn(b"HTTP/1.0 204 No Content", wire)
+        self.assertNotIn(b"Content-Length", wire)
+        self.assertNotIn(b"Transfer-Encoding", wire)
+        self.assertTrue(wire.endswith(b"\r\n\r\n"))
+
+    def test_304_response_has_no_body_or_framing_headers(self):
+        def app(environ, start_response):
+            start_response("304 Not Modified", [("Content-Length", "3")])
+            return [b"abc"]
+
+        inst = self._run_app(app)
+        wire = inst.channel.written
+        self.assertIn(b"HTTP/1.0 304 Not Modified", wire)
+        self.assertNotIn(b"Content-Length", wire)
+        self.assertNotIn(b"Transfer-Encoding", wire)
+        self.assertTrue(wire.endswith(b"\r\n\r\n"))
+
+    def test_file_wrapper_regression_after_start_response(self):
+        from waitress.buffers import ReadOnlyFileBasedBuffer
+
+        f = io.BytesIO(b"abc")
+        app_iter = ReadOnlyFileBasedBuffer(f, 8192)
+
+        def app(environ, start_response):
+            start_response("200 OK", [("Content-Length", "3")])
+            return app_iter
+
+        inst = self._run_app(app)
+        wire = inst.channel.written
+        self.assertIn(b"HTTP/1.0 200 OK", wire)
+        self.assertIn(b"Content-Length: 3", wire)
+        self.assertListEqual(inst.channel.otherdata, [app_iter])
+
+    def test_duplicate_content_length_same_value_normalized(self):
+        def app(environ, start_response):
+            start_response(
+                "200 OK",
+                [("content-length", "5"), ("Content-Length", "5")],
+            )
+            return [b"hello"]
+
+        inst = self._makeOne()
+        inst.channel.server.application = app
+        inst.execute()
+        cl_headers = [
+            (k, v)
+            for k, v in inst.response_headers
+            if k.lower() == "content-length"
+        ]
+        self.assertEqual(cl_headers, [("Content-Length", "5")])
+        self.assertEqual(inst.content_length, 5)
+        inst.finish()
+        self.assertEqual(inst.channel.written.count(b"Content-Length:"), 1)
+
+    def test_duplicate_content_length_conflicting_rejected(self):
+        def app(environ, start_response):
+            start_response(
+                "200 OK",
+                [("Content-Length", "5"), ("content-length", "6")],
+            )
+            return [b"hello"]
+
+        inst = self._makeOne()
+        inst.channel.server.application = app
+        with self.assertRaises(AssertionError):
+            inst.execute()
+
+    def test_invalid_content_length_rejected(self):
+        for bad in ("-1", "1.5", "", "0x10", " 5", "5 "):
+            def app(environ, start_response, bad=bad):
+                start_response("200 OK", [("Content-Length", bad)])
+                return [b"hello"]
+
+            inst = self._makeOne()
+            inst.channel.server.application = app
+            with self.assertRaises(ValueError):
+                inst.execute()
+
+    def test_invalid_status_line_rejected(self):
+        for bad in ("20 OK", "2000 OK", "200 OK\r", "200\nOK", " 200 OK"):
+            def app(environ, start_response, bad=bad):
+                start_response(bad, [])
+                return [b"hello"]
+
+            inst = self._makeOne()
+            inst.channel.server.application = app
+            with self.assertRaises(ValueError):
+                inst.execute()
+
+    def test_invalid_header_token_rejected(self):
+        for bad in ("a b", "a:b", "a\rb", ""):
+            def app(environ, start_response, bad=bad):
+                start_response("200 OK", [(bad, "value")])
+                return [b"hello"]
+
+            inst = self._makeOne()
+            inst.channel.server.application = app
+            with self.assertRaises(ValueError):
+                inst.execute()
+
+    def test_header_value_control_characters_rejected(self):
+        for bad in ("a\nb", "a\rb", "a\x00b", "a\x1fb"):
+            def app(environ, start_response, bad=bad):
+                start_response("200 OK", [("X-Bad", bad)])
+                return [b"hello"]
+
+            inst = self._makeOne()
+            inst.channel.server.application = app
+            with self.assertRaises(ValueError):
+                inst.execute()
+
+    def test_latin1_header_value_accepted(self):
+        def app(environ, start_response):
+            start_response("200 OK", [("X-Latin", "caf\xe9")])
+            return [b"ok"]
+
+        inst = self._run_app(app)
+        self.assertIn(b"X-Latin: caf\xe9", inst.channel.written)
+
+    def test_repeated_set_cookie_headers_kept(self):
+        def app(environ, start_response):
+            start_response(
+                "200 OK",
+                [
+                    ("Set-Cookie", "a=1"),
+                    ("Set-Cookie", "b=2"),
+                    ("Content-Length", "2"),
+                ],
+            )
+            return [b"ok"]
+
+        inst = self._run_app(app)
+        wire = inst.channel.written
+        self.assertIn(b"Set-Cookie: a=1", wire)
+        self.assertIn(b"Set-Cookie: b=2", wire)
+        self.assertEqual(wire.count(b"Set-Cookie:"), 2)
+
+    def test_task_holds_its_own_header_list_copy(self):
+        headers = [("Content-Length", "2")]
+
+        def app(environ, start_response):
+            start_response("200 OK", headers)
+            return [b"ok"]
+
+        inst = self._makeOne()
+        inst.channel.server.application = app
+        inst.execute()
+        headers.append(("X-Mutated", "after the fact"))
+        self.assertNotIn(("X-Mutated", "after the fact"), inst.response_headers)
+        self.assertEqual(
+            [
+                (k, v)
+                for k, v in inst.response_headers
+                if k.lower() == "content-length"
+            ],
+            [("Content-Length", "2")],
+        )
 
     def test_get_environment_already_cached(self):
         inst = self._makeOne()

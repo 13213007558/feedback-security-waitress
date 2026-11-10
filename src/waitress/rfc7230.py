@@ -104,6 +104,26 @@ AUTHORITY_FORM_RE = re.compile(
 # Pre-compiled regular expressions for use elsewhere
 ONLY_HEXDIG_RE = re.compile(("^" + HEXDIG + "+$").encode("latin-1"))
 ONLY_DIGIT_RE = re.compile(("^" + DIGIT + "+$").encode("latin-1"))
+# RFC 9112 Section 4: status-line = HTTP-version SP status-code SP
+# reason-phrase, where the reason-phrase is made of tab, space, VCHAR and
+# obs-text (RFC 7230 Section 3.1.2).
+REASON_PHRASE = "[" + VCHAR + OBS_TEXT + "]"
+STATUS_LINE = "^" + DIGIT + "{3}(?:[ \t](?:[ \t]|" + REASON_PHRASE + ")+)?\\Z"
+STATUS_LINE_RE = re.compile(STATUS_LINE.encode("latin-1"))
+# PEP 3333 header names have to be RFC 7230 tokens.
+HEADER_TOKEN_RE = re.compile(("^" + TOKEN + "\\Z").encode("latin-1"))
+# RFC 7230 field-value, allowing the optional whitespace that the grammar
+# puts around field-content.
+HEADER_VALUE = (
+    "^[ \t]*(?:"
+    + REASON_PHRASE
+    + "+(?:[ \t]+"
+    + REASON_PHRASE
+    + "+)*)?[ \t]*\\Z"
+)
+HEADER_VALUE_RE = re.compile(HEADER_VALUE.encode("latin-1"))
+# RFC 9112 Section 3.2: a Content-Length value is 1*DIGIT.
+CONTENT_LENGTH_RE = re.compile(("^" + DIGIT + "+\\Z").encode("latin-1"))
 HEADER_FIELD_RE = re.compile(
     (
         "^(?P<name>" + TOKEN + "):" + OWS + "(?P<value>" + FIELD_VALUE + ")" + OWS + "$"

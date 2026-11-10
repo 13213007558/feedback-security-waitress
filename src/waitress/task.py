@@ -18,6 +18,12 @@ import threading
 import time
 
 from .buffers import ReadOnlyFileBasedBuffer
+from .rfc7230 import (
+    CONTENT_LENGTH_RE,
+    HEADER_TOKEN_RE,
+    HEADER_VALUE_RE,
+    STATUS_LINE_RE,
+)
 from .utilities import build_http_date, logger, queue_logger
 
 rename_headers = {  # or keep them without the HTTP_ prefix added
@@ -292,6 +298,18 @@ class Task:
 
         self.response_headers = response_headers
 
+    def reset_response_state(self):
+        # A start_response call carrying exc_info replaces the pending
+        # response entirely (PEP 3333). Every piece of framing state derived
+        # from the previous response has to go as well, otherwise the stale
+        # Content-Length or chunked flag would corrupt the replacement.
+        self.response_headers = []
+        self.content_length = None
+        self.content_bytes_written = 0
+        self.chunked_response = False
+        self.logged_write_excess = False
+        self.logged_write_no_body = False
+
     def start(self):
         self.start_time = time.time()
 
@@ -367,6 +385,73 @@ class WSGITask(Task):
 
     environ = None
 
+    def _validate_response(self, status, headers):
+        # Validate the whole candidate response and only return it once every
+        # part is sound, so a rejected candidate cannot leave half of its
+        # status, headers or framing state on the task.
+        if not isinstance(status, str):
+            raise AssertionError("status %s is not a string" % status)
+        if not STATUS_LINE_RE.match(status.encode("latin-1")):
+            raise ValueError("Invalid status line: %s" % status)
+
+        candidate_headers = []
+        content_length = None
+        for k, v in headers:
+            if not isinstance(k, str):
+                raise AssertionError(
+                    f"Header name {k!r} is not a string in {(k, v)!r}"
+                )
+            if not isinstance(v, str):
+                raise AssertionError(
+                    f"Header value {v!r} is not a string in {(k, v)!r}"
+                )
+
+            # encoding also rejects any character that is not Latin-1
+            k_bytes = k.encode("latin-1")
+            v_bytes = v.encode("latin-1")
+
+            if not HEADER_TOKEN_RE.match(k_bytes):
+                raise ValueError("Invalid header token: %s" % k)
+            if not HEADER_VALUE_RE.match(v_bytes):
+                raise ValueError(
+                    "carriage return/line feed/control character present "
+                    "in header value"
+                )
+
+            kl = k.lower()
+            if kl == "content-length":
+                if not CONTENT_LENGTH_RE.match(v_bytes):
+                    raise ValueError(
+                        "Content-Length must be a non-negative decimal "
+                        "integer: %s" % v
+                    )
+                if content_length is not None and content_length != v:
+                    # RFC 9112 section 3.2: conflicting Content-Length
+                    # field values make the message unanswerable.
+                    raise AssertionError(
+                        "Conflicting Content-Length headers: %s and %s"
+                        % (content_length, v)
+                    )
+                content_length = v
+            elif kl in hop_by_hop:
+                raise AssertionError(
+                    '%s is a "hop-by-hop" header; it cannot be used by '
+                    "a WSGI application (see PEP 3333)" % k
+                )
+
+            if kl == "content-length":
+                # identical repeated values are kept as a single field
+                already_present = any(
+                    name.lower() == "content-length" for name, _ in candidate_headers
+                )
+                if not already_present:
+                    candidate_headers.append((k, v))
+            else:
+                # every other field, including repeated Set-Cookie, stays
+                candidate_headers.append((k, v))
+
+        return status, candidate_headers, content_length
+
     def execute(self):
         environ = self.get_environment()
 
@@ -375,6 +460,7 @@ class WSGITask(Task):
                 raise AssertionError(
                     "start_response called a second time without providing exc_info."
                 )
+            replacing = False
             if exc_info:
                 try:
                     if self.wrote_header:
@@ -383,53 +469,26 @@ class WSGITask(Task):
                         # 2. "service" method in channel.py
                         # 3. "handler_thread" method in task.py
                         raise exc_info[1]
-                    else:
-                        # As per WSGI spec existing headers must be cleared
-                        self.response_headers = []
+                    replacing = True
                 finally:
                     exc_info = None
 
-            self.complete = True
+            status, candidate_headers, content_length = self._validate_response(
+                status, headers
+            )
 
-            if not isinstance(status, str):
-                raise AssertionError("status %s is not a string" % status)
-            if "\n" in status or "\r" in status:
-                raise ValueError(
-                    "carriage return/line feed character present in status"
-                )
-
+            # The candidate is fully valid. Only now replace the previous
+            # response (PEP 3333 exc_info semantics), dropping all of its
+            # framing state as well, and commit the new one atomically so a
+            # rejected candidate can never leave half a response behind.
+            if replacing:
+                self.reset_response_state()
+            # Take our own copy so later mutation of the application's list
+            # cannot change the response held by the task.
             self.status = status
-
-            # Prepare the headers for output
-            for k, v in headers:
-                if not isinstance(k, str):
-                    raise AssertionError(
-                        f"Header name {k!r} is not a string in {(k, v)!r}"
-                    )
-                if not isinstance(v, str):
-                    raise AssertionError(
-                        f"Header value {v!r} is not a string in {(k, v)!r}"
-                    )
-
-                if "\n" in v or "\r" in v:
-                    raise ValueError(
-                        "carriage return/line feed character present in header value"
-                    )
-                if "\n" in k or "\r" in k:
-                    raise ValueError(
-                        "carriage return/line feed character present in header name"
-                    )
-
-                kl = k.lower()
-                if kl == "content-length":
-                    self.content_length = int(v)
-                elif kl in hop_by_hop:
-                    raise AssertionError(
-                        '%s is a "hop-by-hop" header; it cannot be used by '
-                        "a WSGI application (see PEP 3333)" % k
-                    )
-
-            self.response_headers.extend(headers)
+            self.response_headers = candidate_headers
+            self.content_length = int(content_length) if content_length else None
+            self.complete = True
 
             # Return a method used to write the response data.
             return self.write

@@ -756,6 +756,51 @@ class TestHTTPChannel(unittest.TestCase):
         self.assertTrue(inst.error_task_class.serviced)
         self.assertTrue(request.closed)
 
+    def test_service_exc_info_after_headers_written_ends_connection(self):
+        # Full wire-level check with a real WSGITask: once the response
+        # headers are on the wire an exc_info replacement must re-raise
+        # instead of appending a second HTTP response, and the channel has
+        # to tear the connection down.
+        from waitress.task import WSGITask
+
+        class LateBoom(Exception):
+            pass
+
+        def application(environ, start_response):
+            write = start_response("200 OK", [("Content-Length", "10")])
+            write(b"abc")
+            start_response(
+                "500 Error",
+                [("Content-Type", "text/plain")],
+                (LateBoom, LateBoom("too late"), None),
+            )
+            return [b"never written"]
+
+        inst, sock, map = self._makeOneWithMap()
+        inst.adj.expose_tracebacks = False
+        inst.server.application = application
+        request = DummyRequest()
+        request.version = "1.1"
+        request.command = "GET"
+        request.path = "/"
+        request.request_uri = "/"
+        request.query = ""
+        request.url_scheme = "http"
+        request.get_body_stream = lambda: b""
+        inst.requests = [request]
+        inst.task_class = WSGITask
+        inst.logger = DummyLogger()
+        inst.service()
+
+        self.assertTrue(inst.close_when_flushed)
+        self.assertListEqual(inst.requests, [])
+        self.assertEqual(len(inst.logger.exceptions), 1)
+        wire = sock.sent
+        self.assertEqual(wire.count(b"HTTP/1.1 "), 1)
+        self.assertIn(b"HTTP/1.1 200 OK", wire)
+        self.assertNotIn(b"500 Error", wire)
+        self.assertTrue(wire.endswith(b"abc"))
+
     def test_cancel_no_requests(self):
         inst, sock, map = self._makeOneWithMap()
         inst.requests = ()
